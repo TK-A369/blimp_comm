@@ -1,0 +1,8 @@
+[package]
+name = "blimp_comm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quinn = "0.11.6"
+tokio = "1.41.1"
