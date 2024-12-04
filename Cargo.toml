@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 quinn = "0.11.6"
 tokio = "1.41.1"
+blimp_onboard_software = { path = "deps/blimp_onboard_software" }
+serde = { version = "1.0.215", features = ["serde_derive"] }
+postcard = { version = "1.1.1", features = ["use-std"] }
