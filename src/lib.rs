@@ -14,16 +14,17 @@ enum ChannelStatus {
     Unknown(std::time::Instant),
     Checking,
     Connected,
+    Listening,
 }
 
 struct ChannelInstance {
     connection: Option<quinn::Connection>,
     status: ChannelStatus,
-    tx_chan: tokio::sync::mpsc::Sender<ChannelMsg>,
+    tx_chan: tokio::sync::broadcast::Sender<ChannelMsg>,
     rx_chan: tokio::sync::broadcast::Receiver<ChannelMsg>,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub enum ChannelMsg {
     Handshake,
     Heartbeat,
@@ -37,6 +38,8 @@ async fn channel_quic_worker(
         tokio::sync::RwLock<Vec<std::sync::Arc<tokio::sync::Mutex<ChannelInstance>>>>,
     >,
     channels: std::sync::Arc<Vec<CommChannel>>,
+    tx_chan_rx: tokio::sync::broadcast::Receiver<ChannelMsg>,
+    rx_chan_tx: tokio::sync::broadcast::Sender<ChannelMsg>,
 ) {
     let this_channel_inst = chans_instances.read().await[channel_id].clone();
     let this_channel_inst_locked = this_channel_inst.lock().await;
@@ -46,14 +49,46 @@ async fn channel_quic_worker(
         .expect("Started channel_quic_worker for a channel without connection!");
     let channel = &channels[channel_id];
 
-    async fn stream_worker(mut stream_tx: quinn::SendStream, mut stream_rx: quinn::RecvStream) {
-        let mut rx_buf: [u8; 1024] = [0; 1024];
+    async fn stream_worker(
+        mut stream_tx: quinn::SendStream,
+        mut stream_rx: quinn::RecvStream,
+        mut tx_chan_rx: tokio::sync::broadcast::Receiver<ChannelMsg>,
+        rx_chan_tx: tokio::sync::broadcast::Sender<ChannelMsg>,
+    ) {
+        let (shutdown_sender_tx, mut shutdown_sender_rx) = tokio::sync::mpsc::channel::<()>(2);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    msg = tx_chan_rx.recv() => {
+                        if let Ok(msg) = msg {
+                            let msg_ser = postcard::to_stdvec(&msg).unwrap();
+                            let len_val_bytes = (msg_ser.len() as u32).to_le_bytes();
+                            if matches!(
+                                stream_tx.write_all(&len_val_bytes).await,
+                                Err(quinn::WriteError::ConnectionLost(_)) | Err(quinn::WriteError::ClosedStream)) {
+                                break;
+                            }
+                            if matches!(
+                                stream_tx.write_all(&msg_ser).await,
+                                Err(quinn::WriteError::ConnectionLost(_)) | Err(quinn::WriteError::ClosedStream)) {
+                                break;
+                            }
+                        }
+                    }
+                    _ = shutdown_sender_rx.recv() => {
+                        break;
+                    }
+                };
+            }
+        });
+
         let mut frame_buf: [u8; 1024] = [0; 1024];
         let mut frame_recv_len: u32 = 0;
         let mut frame_expected_len: Option<u32> = None;
         loop {
             let msg = stream_rx
-                .read(&mut rx_buf[(frame_recv_len as usize)..])
+                .read(&mut frame_buf[(frame_recv_len as usize)..])
                 .await;
             match msg {
                 Ok(Some(recv_size)) => {
@@ -72,6 +107,7 @@ async fn channel_quic_worker(
                             let frame_slice = &frame_buf[4..(4 + exp_len as usize)];
                             if let Ok(msg_des) = postcard::from_bytes::<ChannelMsg>(frame_slice) {
                                 println!("Got message: {:?}", msg_des);
+                                rx_chan_tx.send(msg_des).unwrap();
                             } else {
                                 eprintln!(
                                     "Couldn't deserialize message received from channel stream!"
@@ -81,6 +117,7 @@ async fn channel_quic_worker(
                     }
                 }
                 Ok(None) => {
+                    shutdown_sender_tx.send(()).await.unwrap();
                     break;
                 }
                 Err(err) => {
@@ -94,7 +131,7 @@ async fn channel_quic_worker(
         CommChannel::Server(socket_addr) => {
             if let Ok((mut stream_tx, mut stream_rx)) = conn.accept_bi().await {
                 println!("Opened stream on channel {}", channel_id);
-                stream_worker(stream_tx, stream_rx).await;
+                stream_worker(stream_tx, stream_rx, tx_chan_rx, rx_chan_tx).await;
             } else {
                 eprintln!(
                     "Error occurred when opening stream on channel {}",
@@ -105,9 +142,11 @@ async fn channel_quic_worker(
         CommChannel::Client(socket_addr) => {
             if let Ok((mut stream_tx, mut stream_rx)) = conn.open_bi().await {
                 stream_tx
-                    .write(&postcard::to_stdvec::<ChannelMsg>(&ChannelMsg::Handshake).unwrap());
+                    .write(&postcard::to_stdvec::<ChannelMsg>(&ChannelMsg::Handshake).unwrap())
+                    .await
+                    .unwrap();
                 println!("Opened stream on channel {}", channel_id);
-                stream_worker(stream_tx, stream_rx);
+                stream_worker(stream_tx, stream_rx, tx_chan_rx, rx_chan_tx).await;
             } else {
                 eprintln!(
                     "Error occurred when opening stream on channel {}",
@@ -125,6 +164,9 @@ pub async fn start_communication(channels: Vec<CommChannel>) {
     let channels = std::sync::Arc::new(channels);
 
     for (i, ch) in channels.iter().enumerate() {
+        let (tx_chan, tx_chan_rx) = tokio::sync::broadcast::channel::<ChannelMsg>(256);
+        let (rx_chan_tx, rx_chan) = tokio::sync::broadcast::channel::<ChannelMsg>(256);
+
         chans_instances
             .write()
             .await
@@ -132,19 +174,35 @@ pub async fn start_communication(channels: Vec<CommChannel>) {
                 ChannelInstance {
                     connection: None,
                     status: ChannelStatus::Unknown(std::time::Instant::now()),
+                    tx_chan,
+                    rx_chan,
                 },
             )));
 
         let chans_instances = chans_instances.clone();
         let channels = channels.clone();
         tokio::spawn(async move {
+            let chans_instances_locked = chans_instances.read().await;
+            let mut inst = chans_instances_locked[i].lock().await;
             match channels[i] {
                 CommChannel::Server(socket_addr) => {
-                    //let endpoint
+                    match inst.status {
+                        ChannelStatus::Unknown(time) => {
+                            if time.elapsed() > std::time::Duration::from_secs(2) {
+                                println!("Listening on channel {}", i);
+                                inst.status=ChannelStatus::Listening;
+
+                                //TODO: QUIC's cryptography stuff
+                                //let server_config = quinn::ServerConfig::new();
+                                let endpoint = quinn::Endpoint::server(server_config, socket_addr));
+                            }
+                        }
+                        ChannelStatus::Checking => panic!("Illegal status for a server channel"),
+                        ChannelStatus::Connected => {}
+                        ChannelStatus::Listening => {}
+                    }
                 }
                 CommChannel::Client(socket_addr) => loop {
-                    let chans_instances_locked = chans_instances.read().await;
-                    let mut inst = chans_instances_locked[i].lock().await;
                     match inst.status {
                         ChannelStatus::Unknown(time) => {
                             if time.elapsed() > std::time::Duration::from_secs(2) {
@@ -161,11 +219,18 @@ pub async fn start_communication(channels: Vec<CommChannel>) {
                                     .await
                                     .unwrap();
                                 inst.connection = Some(conn);
-                                tokio::spawn(channel_quic_worker(i, chans_instances.clone()));
+                                tokio::spawn(channel_quic_worker(
+                                    i,
+                                    chans_instances.clone(),
+                                    channels.clone(),
+                                    tx_chan_rx.resubscribe(),
+                                    rx_chan_tx.clone(),
+                                ));
                             }
                         }
                         ChannelStatus::Checking => {}
                         ChannelStatus::Connected => {}
+                        ChannelStatus::Listening => panic!("Illegal status for a client channel"),
                     }
                 },
             }
