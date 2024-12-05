@@ -1,5 +1,6 @@
 use postcard;
 use quinn;
+use rustls;
 use serde;
 use tokio;
 
@@ -10,6 +11,7 @@ pub enum CommChannel {
     Client(core::net::SocketAddr),
 }
 
+#[derive(Debug)]
 enum ChannelStatus {
     Unknown(std::time::Instant),
     Checking,
@@ -32,6 +34,9 @@ pub enum ChannelMsg {
     MessageB2G(blimp_onboard_software::obsw_algo::MessageB2G),
 }
 
+// https://github.com/quinn-rs/quinn/blob/31a0440009afd5a7e29101410aa9d3da2d1f8077/quinn/examples/common/mod.rs#L73
+pub const ALPN_QUIC_HTTP: &[&[u8]] = &[b"hq-29"];
+
 async fn channel_quic_worker(
     channel_id: usize,
     chans_instances: std::sync::Arc<
@@ -41,6 +46,8 @@ async fn channel_quic_worker(
     tx_chan_rx: tokio::sync::broadcast::Receiver<ChannelMsg>,
     rx_chan_tx: tokio::sync::broadcast::Sender<ChannelMsg>,
 ) {
+    println!("Starting channel {} worker task...", channel_id);
+
     let this_channel_inst = chans_instances.read().await[channel_id].clone();
     let this_channel_inst_locked = this_channel_inst.lock().await;
     let conn = this_channel_inst_locked
@@ -55,6 +62,8 @@ async fn channel_quic_worker(
         mut tx_chan_rx: tokio::sync::broadcast::Receiver<ChannelMsg>,
         rx_chan_tx: tokio::sync::broadcast::Sender<ChannelMsg>,
     ) {
+        println!("Starting stream worker task...");
+
         let (shutdown_sender_tx, mut shutdown_sender_rx) = tokio::sync::mpsc::channel::<()>(2);
 
         tokio::spawn(async move {
@@ -158,12 +167,17 @@ async fn channel_quic_worker(
 }
 
 pub async fn start_communication(channels: Vec<CommChannel>) {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .unwrap();
     let chans_instances = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::<
         std::sync::Arc<tokio::sync::Mutex<ChannelInstance>>,
     >::new()));
     let channels = std::sync::Arc::new(channels);
 
     for (i, ch) in channels.iter().enumerate() {
+        println!("Beginning initializing channel {}", i);
+
         let (tx_chan, tx_chan_rx) = tokio::sync::broadcast::channel::<ChannelMsg>(256);
         let (rx_chan_tx, rx_chan) = tokio::sync::broadcast::channel::<ChannelMsg>(256);
 
@@ -182,26 +196,96 @@ pub async fn start_communication(channels: Vec<CommChannel>) {
         let chans_instances = chans_instances.clone();
         let channels = channels.clone();
         tokio::spawn(async move {
-            let chans_instances_locked = chans_instances.read().await;
-            let mut inst = chans_instances_locked[i].lock().await;
+            println!("Started channel {} monitor task", i);
+
+            let inst_arc = {
+                let chans_instances_locked = chans_instances.read().await;
+                chans_instances_locked[i].clone()
+            };
+            let mut inst = inst_arc.lock().await;
             match channels[i] {
-                CommChannel::Server(socket_addr) => {
+                CommChannel::Server(socket_addr) => loop {
+                    println!("Channel {} status: {:?}", i, inst.status);
                     match inst.status {
                         ChannelStatus::Unknown(time) => {
                             if time.elapsed() > std::time::Duration::from_secs(2) {
                                 println!("Listening on channel {}", i);
-                                inst.status=ChannelStatus::Listening;
+                                inst.status = ChannelStatus::Listening;
 
-                                //TODO: QUIC's cryptography stuff
-                                //let server_config = quinn::ServerConfig::new();
-                                let endpoint = quinn::Endpoint::server(server_config, socket_addr));
+                                let cert_path = std::path::Path::new("./cert.der");
+                                let key_path = std::path::Path::new("./key.der");
+
+                                let (cert, key) = match std::fs::read(&cert_path)
+                                    .and_then(|x| std::fs::read(&key_path).and_then(|y| Ok((x, y))))
+                                {
+                                    Ok((cert, key)) => (
+                                        rustls::pki_types::CertificateDer::from(cert),
+                                        rustls::pki_types::PrivateKeyDer::try_from(key)
+                                            .expect("Couldn't get key"),
+                                    ),
+                                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                        println!("Generating self-signed certificate");
+                                        let cert = rcgen::generate_simple_self_signed(
+                                            vec!["localhost", "127.0.0.1"]
+                                                .iter()
+                                                .map(|&x| x.to_string())
+                                                .collect::<Vec<String>>(),
+                                        )
+                                        .unwrap();
+                                        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(
+                                            cert.key_pair.serialize_der(),
+                                        );
+                                        let cert = cert.cert.into();
+
+                                        std::fs::write(&cert_path, &cert).expect(
+                                            "Couldn't write self-signed certificate to file",
+                                        );
+                                        std::fs::write(&key_path, key.secret_pkcs8_der())
+                                            .expect("couldn't write self-signed key to file");
+
+                                        (cert, key.into())
+                                    }
+                                    Err(err) => panic!("Couldn't read certificate"),
+                                };
+
+                                let mut server_crypto = rustls::ServerConfig::builder()
+                                    .with_no_client_auth()
+                                    .with_single_cert(vec![cert], key)
+                                    .expect("Couldn't create QUIC server config");
+                                server_crypto.alpn_protocols =
+                                    ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+                                let server_config =
+                                    quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+                                        quinn::crypto::rustls::QuicServerConfig::try_from(
+                                            server_crypto,
+                                        )
+                                        .expect("Couldn't create server configuration"),
+                                    ));
+                                let endpoint = quinn::Endpoint::server(server_config, socket_addr)
+                                    .expect("Couldn't open QUIC server endpoint");
+
+                                println!("Awaiting for incoming QUIC client...");
+                                let conn = endpoint
+                                    .accept()
+                                    .await
+                                    .expect("Couldn't accept conenction")
+                                    .await
+                                    .expect("Couldn't accept connection");
+                                inst.connection = Some(conn);
+                                tokio::spawn(channel_quic_worker(
+                                    i,
+                                    chans_instances.clone(),
+                                    channels.clone(),
+                                    tx_chan_rx.resubscribe(),
+                                    rx_chan_tx.clone(),
+                                ));
                             }
                         }
                         ChannelStatus::Checking => panic!("Illegal status for a server channel"),
                         ChannelStatus::Connected => {}
                         ChannelStatus::Listening => {}
                     }
-                }
+                },
                 CommChannel::Client(socket_addr) => loop {
                     match inst.status {
                         ChannelStatus::Unknown(time) => {
