@@ -205,7 +205,7 @@ pub async fn start_communication(channels: Vec<CommChannel>) {
             let mut inst = inst_arc.lock().await;
             match channels[i] {
                 CommChannel::Server(socket_addr) => loop {
-                    println!("Channel {} status: {:?}", i, inst.status);
+                    //println!("Channel {} status: {:?}", i, inst.status);
                     match inst.status {
                         ChannelStatus::Unknown(time) => {
                             if time.elapsed() > std::time::Duration::from_secs(2) {
@@ -226,7 +226,7 @@ pub async fn start_communication(channels: Vec<CommChannel>) {
                                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                                         println!("Generating self-signed certificate");
                                         let cert = rcgen::generate_simple_self_signed(
-                                            vec!["localhost", "127.0.0.1"]
+                                            vec!["localhost", "127.0.0.1", "blimp_onboard"]
                                                 .iter()
                                                 .map(|&x| x.to_string())
                                                 .collect::<Vec<String>>(),
@@ -268,7 +268,7 @@ pub async fn start_communication(channels: Vec<CommChannel>) {
                                 let conn = endpoint
                                     .accept()
                                     .await
-                                    .expect("Couldn't accept conenction")
+                                    .expect("Couldn't accept connection")
                                     .await
                                     .expect("Couldn't accept connection");
                                 inst.connection = Some(conn);
@@ -285,6 +285,7 @@ pub async fn start_communication(channels: Vec<CommChannel>) {
                         ChannelStatus::Connected => {}
                         ChannelStatus::Listening => {}
                     }
+                    tokio::task::yield_now().await;
                 },
                 CommChannel::Client(socket_addr) => loop {
                     match inst.status {
@@ -293,23 +294,57 @@ pub async fn start_communication(channels: Vec<CommChannel>) {
                                 println!("Checking channel {}", i);
                                 inst.status = ChannelStatus::Checking;
 
-                                let endpoint = quinn::Endpoint::client(
+                                let mut endpoint = quinn::Endpoint::client(
                                     (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
                                 )
                                 .unwrap();
-                                let conn = endpoint
-                                    .connect(socket_addr, "blimp_onboard")
-                                    .unwrap()
-                                    .await
+
+                                let mut root_certs = rustls::RootCertStore::empty();
+                                root_certs
+                                    .add(rustls::pki_types::CertificateDer::from(
+                                        std::fs::read("cert.der")
+                                            .expect("Couldn't read certificate"),
+                                    ))
                                     .unwrap();
-                                inst.connection = Some(conn);
-                                tokio::spawn(channel_quic_worker(
-                                    i,
-                                    chans_instances.clone(),
-                                    channels.clone(),
-                                    tx_chan_rx.resubscribe(),
-                                    rx_chan_tx.clone(),
+                                let mut client_crypto = rustls::ClientConfig::builder()
+                                    .with_root_certificates(root_certs)
+                                    .with_no_client_auth();
+                                client_crypto.alpn_protocols =
+                                    ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+                                let client_config = quinn::ClientConfig::new(std::sync::Arc::new(
+                                    quinn::crypto::rustls::QuicClientConfig::try_from(
+                                        client_crypto,
+                                    )
+                                    .unwrap(),
                                 ));
+                                endpoint.set_default_client_config(client_config);
+                                println!("Set client's default config");
+
+                                let conn = match endpoint.connect(socket_addr, "blimp_onboard") {
+                                    Ok(conn) => conn.await.map_err(|err| {
+                                        eprintln!("Connection error: {}", err);
+                                        ()
+                                    }),
+                                    Err(err) => {
+                                        eprintln!("Connecting error: {}", err);
+                                        Err(())
+                                    }
+                                };
+                                if let Ok(conn) = conn {
+                                    println!("Successfully opened connection!");
+                                    inst.connection = Some(conn);
+                                    inst.status = ChannelStatus::Connected;
+                                    tokio::spawn(channel_quic_worker(
+                                        i,
+                                        chans_instances.clone(),
+                                        channels.clone(),
+                                        tx_chan_rx.resubscribe(),
+                                        rx_chan_tx.clone(),
+                                    ));
+                                } else {
+                                    println!("Couldn't connect");
+                                    inst.status = ChannelStatus::Unknown(std::time::Instant::now());
+                                }
                             }
                         }
                         ChannelStatus::Checking => {}
