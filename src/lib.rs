@@ -138,7 +138,8 @@ async fn channel_quic_worker(
 
     match channel {
         CommChannel::Server(socket_addr) => {
-            if let Ok((mut stream_tx, mut stream_rx)) = conn.accept_bi().await {
+            println!("Awaiting channel...");
+            if let Ok((stream_tx, stream_rx)) = conn.accept_bi().await {
                 println!("Opened stream on channel {}", channel_id);
                 stream_worker(stream_tx, stream_rx, tx_chan_rx, rx_chan_tx).await;
             } else {
@@ -149,7 +150,8 @@ async fn channel_quic_worker(
             }
         }
         CommChannel::Client(socket_addr) => {
-            if let Ok((mut stream_tx, mut stream_rx)) = conn.open_bi().await {
+            println!("Opening channel...");
+            if let Ok((mut stream_tx, stream_rx)) = conn.open_bi().await {
                 stream_tx
                     .write(&postcard::to_stdvec::<ChannelMsg>(&ChannelMsg::Handshake).unwrap())
                     .await
@@ -351,6 +353,7 @@ pub async fn start_communication(channels: Vec<CommChannel>) {
                         ChannelStatus::Connected => {}
                         ChannelStatus::Listening => panic!("Illegal status for a client channel"),
                     }
+                    tokio::task::yield_now().await;
                 },
             }
         });
